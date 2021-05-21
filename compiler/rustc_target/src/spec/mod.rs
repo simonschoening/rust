@@ -857,6 +857,7 @@ supported_targets! {
 
     ("msp430-none-elf", msp430_none_elf),
 
+    ("riscv64gc-unknown-hermit", riscv64gc_unknown_hermit),
     ("aarch64-unknown-hermit", aarch64_unknown_hermit),
     ("x86_64-unknown-hermit", x86_64_unknown_hermit),
 
