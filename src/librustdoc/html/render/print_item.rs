@@ -578,12 +578,13 @@ fn item_trait(w: &mut Buffer, cx: &Context<'_>, it: &clean::Item, t: &clean::Tra
         info!("Documenting {} on {:?}", name, t.name);
         let item_type = m.type_();
         let id = cx.derive_id(format!("{}.{}", item_type, name));
+        write!(w, "<details class=\"rustdoc-toggle\" open><summary>");
         write!(w, "<h3 id=\"{id}\" class=\"method\"><code>", id = id,);
         render_assoc_item(w, m, AssocItemLink::Anchor(Some(&id)), ItemType::Impl, cx);
         w.write_str("</code>");
         render_stability_since(w, m, t, cx.tcx());
         write_srclink(cx, m, w);
-        w.write_str("</h3>");
+        w.write_str("</h3></summary>");
         document(w, cx, m, Some(t));
     }
 
@@ -642,7 +643,7 @@ fn item_trait(w: &mut Buffer, cx: &Context<'_>, it: &clean::Item, t: &clean::Tra
     // If there are methods directly on this trait object, render them here.
     render_assoc_items(w, cx, it, it.def_id.expect_real(), AssocItemRender::All);
 
-    if let Some(implementors) = cx.cache.implementors.get(&it.def_id) {
+    if let Some(implementors) = cx.cache.implementors.get(&it.def_id.expect_real()) {
         // The DefId is for the first Type found with that name. The bool is
         // if any Types with the same name but different DefId have been found.
         let mut implementor_dups: FxHashMap<Symbol, (DefId, bool)> = FxHashMap::default();
@@ -1501,7 +1502,7 @@ fn document_non_exhaustive(w: &mut Buffer, item: &clean::Item) {
             w.write_str(
                 "Non-exhaustive structs could have additional fields added in future. \
                  Therefore, non-exhaustive structs cannot be constructed in external crates \
-                 using the traditional <code>Struct {{ .. }}</code> syntax; cannot be \
+                 using the traditional <code>Struct { .. }</code> syntax; cannot be \
                  matched against without a wildcard <code>..</code>; and \
                  struct update syntax will not work.",
             );

@@ -418,9 +418,11 @@ impl<'tcx> Clean<Type> for ty::ProjectionTy<'tcx> {
             GenericBound::TraitBound(t, _) => t.trait_,
             GenericBound::Outlives(_) => panic!("cleaning a trait got a lifetime"),
         };
+        let self_type = self.self_ty().clean(cx);
         Type::QPath {
             name: cx.tcx.associated_item(self.item_def_id).ident.name,
-            self_type: box self.self_ty().clean(cx),
+            self_def_id: self_type.def_id(),
+            self_type: box self_type,
             trait_: box trait_,
         }
     }
@@ -533,8 +535,7 @@ impl Clean<Generics> for hir::Generics<'_> {
                 match param.kind {
                     GenericParamDefKind::Lifetime => unreachable!(),
                     GenericParamDefKind::Type { did, ref bounds, .. } => {
-                        cx.impl_trait_bounds
-                            .insert(FakeDefId::new_real(did).into(), bounds.clone());
+                        cx.impl_trait_bounds.insert(did.into(), bounds.clone());
                     }
                     GenericParamDefKind::Const { .. } => unreachable!(),
                 }
@@ -615,7 +616,7 @@ impl<'a, 'tcx> Clean<Generics> for (&'a ty::Generics, ty::GenericPredicates<'tcx
             .collect::<Vec<GenericParamDef>>();
 
         // param index -> [(DefId of trait, associated type name, type)]
-        let mut impl_trait_proj = FxHashMap::<u32, Vec<(FakeDefId, Symbol, Ty<'tcx>)>>::default();
+        let mut impl_trait_proj = FxHashMap::<u32, Vec<(DefId, Symbol, Ty<'tcx>)>>::default();
 
         let where_predicates = preds
             .predicates
@@ -687,13 +688,7 @@ impl<'a, 'tcx> Clean<Generics> for (&'a ty::Generics, ty::GenericPredicates<'tcx
                 if let Some(proj) = impl_trait_proj.remove(&idx) {
                     for (trait_did, name, rhs) in proj {
                         let rhs = rhs.clean(cx);
-                        simplify::merge_bounds(
-                            cx,
-                            &mut bounds,
-                            trait_did.expect_real(),
-                            name,
-                            &rhs,
-                        );
+                        simplify::merge_bounds(cx, &mut bounds, trait_did, name, &rhs);
                     }
                 }
             } else {
@@ -1111,7 +1106,7 @@ impl Clean<Item> for ty::AssocItem {
                         .filter_map(|pred| {
                             let (name, self_type, trait_, bounds) = match *pred {
                                 WherePredicate::BoundPredicate {
-                                    ty: QPath { ref name, ref self_type, ref trait_ },
+                                    ty: QPath { ref name, ref self_type, ref trait_, .. },
                                     ref bounds,
                                 } => (name, self_type, trait_, bounds),
                                 _ => return None,
@@ -1183,8 +1178,7 @@ fn clean_qpath(hir_ty: &hir::Ty<'_>, cx: &mut DocContext<'_>) -> Type {
                 if let Some(new_ty) = cx.ty_substs.get(&did).cloned() {
                     return new_ty;
                 }
-                if let Some(bounds) = cx.impl_trait_bounds.remove(&FakeDefId::new_real(did).into())
-                {
+                if let Some(bounds) = cx.impl_trait_bounds.remove(&did.into()) {
                     return ImplTrait(bounds);
                 }
             }
@@ -1290,16 +1284,15 @@ fn clean_qpath(hir_ty: &hir::Ty<'_>, cx: &mut DocContext<'_>) -> Type {
 
             let segments = if p.is_global() { &p.segments[1..] } else { &p.segments };
             let trait_segments = &segments[..segments.len() - 1];
+            let trait_def = cx.tcx.associated_item(p.res.def_id()).container.id();
             let trait_path = self::Path {
                 global: p.is_global(),
-                res: Res::Def(
-                    DefKind::Trait,
-                    cx.tcx.associated_item(p.res.def_id()).container.id(),
-                ),
+                res: Res::Def(DefKind::Trait, trait_def),
                 segments: trait_segments.clean(cx),
             };
             Type::QPath {
                 name: p.segments.last().expect("segments were empty").ident.name,
+                self_def_id: Some(DefId::local(qself.hir_id.owner.local_def_index)),
                 self_type: box qself.clean(cx),
                 trait_: box resolve_type(cx, trait_path, hir_id),
             }
@@ -1314,6 +1307,7 @@ fn clean_qpath(hir_ty: &hir::Ty<'_>, cx: &mut DocContext<'_>) -> Type {
             let trait_path = hir::Path { span, res, segments: &[] }.clean(cx);
             Type::QPath {
                 name: segment.ident.name,
+                self_def_id: res.opt_def_id(),
                 self_type: box qself.clean(cx),
                 trait_: box resolve_type(cx, trait_path, hir_id),
             }

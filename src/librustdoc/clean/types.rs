@@ -73,10 +73,6 @@ impl FakeDefId {
         Self::Fake(DefIndex::from(id), krate)
     }
 
-    crate fn new_real(id: DefId) -> Self {
-        Self::Real(id)
-    }
-
     #[inline]
     crate fn is_local(self) -> bool {
         match self {
@@ -470,7 +466,7 @@ impl Item {
             .filter_map(|ItemLink { link: s, link_text, did, ref fragment }| {
                 match did {
                     Some(did) => {
-                        if let Some((mut href, ..)) = href(did.expect_real(), cx) {
+                        if let Some((mut href, ..)) = href(did.clone(), cx) {
                             if let Some(ref fragment) = *fragment {
                                 href.push('#');
                                 href.push_str(fragment);
@@ -972,7 +968,7 @@ crate struct ItemLink {
     /// This may not be the same as `link` if there was a disambiguator
     /// in an intra-doc link (e.g. \[`fn@f`\])
     pub(crate) link_text: String,
-    pub(crate) did: Option<FakeDefId>,
+    pub(crate) did: Option<DefId>,
     /// The url fragment to append to the link
     pub(crate) fragment: Option<String>,
 }
@@ -1523,6 +1519,7 @@ crate enum Type {
     QPath {
         name: Symbol,
         self_type: Box<Type>,
+        self_def_id: Option<DefId>,
         trait_: Box<Type>,
     },
 
@@ -1669,7 +1666,7 @@ impl Type {
 
     crate fn projection(&self) -> Option<(&Type, DefId, Symbol)> {
         let (self_, trait_, name) = match self {
-            QPath { self_type, trait_, name } => (self_type, trait_, name),
+            QPath { self_type, trait_, name, .. } => (self_type, trait_, name),
             _ => return None,
         };
         let trait_did = match **trait_ {
@@ -2235,7 +2232,7 @@ crate struct Impl {
     crate items: Vec<Item>,
     crate negative_polarity: bool,
     crate synthetic: bool,
-    crate blanket_impl: Option<Type>,
+    crate blanket_impl: Option<Box<Type>>,
 }
 
 impl Impl {

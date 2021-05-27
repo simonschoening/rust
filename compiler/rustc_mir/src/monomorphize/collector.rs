@@ -322,7 +322,7 @@ fn collect_roots(tcx: TyCtxt<'_>, mode: MonoItemCollectionMode) -> Vec<MonoItem<
     let mut roots = Vec::new();
 
     {
-        let entry_fn = tcx.entry_fn(LOCAL_CRATE);
+        let entry_fn = tcx.entry_fn(());
 
         debug!("collect_roots: entry_fn = {:?}", entry_fn);
 
@@ -342,7 +342,8 @@ fn collect_roots(tcx: TyCtxt<'_>, mode: MonoItemCollectionMode) -> Vec<MonoItem<
         .collect()
 }
 
-// Collect all monomorphized items reachable from `starting_point`
+/// Collect all monomorphized items reachable from `starting_point`, and emit a note diagnostic if a
+/// post-monorphization error is encountered during a collection step.
 fn collect_items_rec<'tcx>(
     tcx: TyCtxt<'tcx>,
     starting_point: Spanned<MonoItem<'tcx>>,
@@ -358,6 +359,31 @@ fn collect_items_rec<'tcx>(
 
     let mut neighbors = Vec::new();
     let recursion_depth_reset;
+
+    //
+    // Post-monomorphization errors MVP
+    //
+    // We can encounter errors while monomorphizing an item, but we don't have a good way of
+    // showing a complete stack of spans ultimately leading to collecting the erroneous one yet.
+    // (It's also currently unclear exactly which diagnostics and information would be interesting
+    // to report in such cases)
+    //
+    // This leads to suboptimal error reporting: a post-monomorphization error (PME) will be
+    // shown with just a spanned piece of code causing the error, without information on where
+    // it was called from. This is especially obscure if the erroneous mono item is in a
+    // dependency. See for example issue #85155, where, before minimization, a PME happened two
+    // crates downstream from libcore's stdarch, without a way to know which dependency was the
+    // cause.
+    //
+    // If such an error occurs in the current crate, its span will be enough to locate the
+    // source. If the cause is in another crate, the goal here is to quickly locate which mono
+    // item in the current crate is ultimately responsible for causing the error.
+    //
+    // To give at least _some_ context to the user: while collecting mono items, we check the
+    // error count. If it has changed, a PME occurred, and we trigger some diagnostics about the
+    // current step of mono items collection.
+    //
+    let error_count = tcx.sess.diagnostic().err_count();
 
     match starting_point.node {
         MonoItem::Static(def_id) => {
@@ -409,6 +435,22 @@ fn collect_items_rec<'tcx>(
                 span_bug!(item.span, "Mismatch between hir::Item type and MonoItem type")
             }
         }
+    }
+
+    // Check for PMEs and emit a diagnostic if one happened. To try to show relevant edges of the
+    // mono item graph where the PME diagnostics are currently the most problematic (e.g. ones
+    // involving a dependency, and the lack of context is confusing) in this MVP, we focus on
+    // diagnostics on edges crossing a crate boundary: the collected mono items which are not
+    // defined in the local crate.
+    if tcx.sess.diagnostic().err_count() > error_count && starting_point.node.krate() != LOCAL_CRATE
+    {
+        tcx.sess.span_note_without_error(
+            starting_point.span,
+            &format!(
+                "the above error was encountered while instantiating `{}`",
+                starting_point.node
+            ),
+        );
     }
 
     record_accesses(tcx, starting_point.node, neighbors.iter().map(|i| &i.node), inlining_map);
@@ -468,7 +510,7 @@ fn shrunk_instance_name(
             after = &s[positions().rev().nth(after).unwrap_or(0)..],
         );
 
-        let path = tcx.output_filenames(LOCAL_CRATE).temp_path_ext("long-type.txt", None);
+        let path = tcx.output_filenames(()).temp_path_ext("long-type.txt", None);
         let written_to_path = std::fs::write(&path, s).ok().map(|_| path);
 
         (shrunk, written_to_path)
