@@ -1,4 +1,4 @@
-use crate::spec::{CodeModel, RelocModel};
+use crate::spec::{CodeModel, RelocModel, TlsModel};
 use crate::spec::Target;
 
 pub fn target() -> Target {
@@ -8,7 +8,8 @@ pub fn target() -> Target {
     base.features = "+m,+a,+f,+d,+c".to_string();
     base.unsupported_abis = super::riscv_base::unsupported_abis();
     base.code_model = Some(CodeModel::Medium);
-    base.relocation_model = RelocModel::Static;
+    base.relocation_model = RelocModel::Pic;
+    base.tls_model = TlsModel::LocalExec;
     base.llvm_abiname = "lp64d".to_string();
 
     Target {
