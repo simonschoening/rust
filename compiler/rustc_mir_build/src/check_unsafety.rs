@@ -29,11 +29,7 @@ struct UnsafetyVisitor<'a, 'tcx> {
 }
 
 impl<'tcx> UnsafetyVisitor<'_, 'tcx> {
-    fn in_safety_context<R>(
-        &mut self,
-        safety_context: SafetyContext,
-        f: impl FnOnce(&mut Self) -> R,
-    ) {
+    fn in_safety_context(&mut self, safety_context: SafetyContext, f: impl FnOnce(&mut Self)) {
         if let (
             SafetyContext::UnsafeBlock { span: enclosing_span, .. },
             SafetyContext::UnsafeBlock { span: block_span, hir_id, .. },
@@ -63,7 +59,6 @@ impl<'tcx> UnsafetyVisitor<'_, 'tcx> {
                 );
             }
             self.safety_context = prev_context;
-            return;
         }
     }
 
@@ -71,6 +66,7 @@ impl<'tcx> UnsafetyVisitor<'_, 'tcx> {
         let (description, note) = kind.description_and_note();
         let unsafe_op_in_unsafe_fn_allowed = self.unsafe_op_in_unsafe_fn_allowed();
         match self.safety_context {
+            SafetyContext::BuiltinUnsafeBlock => {}
             SafetyContext::UnsafeBlock { ref mut used, .. } => {
                 if !self.body_unsafety.is_unsafe() || !unsafe_op_in_unsafe_fn_allowed {
                     // Mark this block as useful
@@ -142,13 +138,23 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
     }
 
     fn visit_block(&mut self, block: &Block) {
-        if let BlockSafety::ExplicitUnsafe(hir_id) = block.safety_mode {
-            self.in_safety_context(
-                SafetyContext::UnsafeBlock { span: block.span, hir_id, used: false },
-                |this| visit::walk_block(this, block),
-            );
-        } else {
-            visit::walk_block(self, block);
+        match block.safety_mode {
+            // compiler-generated unsafe code should not count towards the usefulness of
+            // an outer unsafe block
+            BlockSafety::BuiltinUnsafe => {
+                self.in_safety_context(SafetyContext::BuiltinUnsafeBlock, |this| {
+                    visit::walk_block(this, block)
+                });
+            }
+            BlockSafety::ExplicitUnsafe(hir_id) => {
+                self.in_safety_context(
+                    SafetyContext::UnsafeBlock { span: block.span, hir_id, used: false },
+                    |this| visit::walk_block(this, block),
+                );
+            }
+            BlockSafety::Safe => {
+                visit::walk_block(self, block);
+            }
         }
     }
 
@@ -166,13 +172,16 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                     self.requires_unsafe(expr.span, CallToUnsafeFunction);
                 } else if let &ty::FnDef(func_did, _) = self.thir[fun].ty.kind() {
                     // If the called function has target features the calling function hasn't,
-                    // the call requires `unsafe`.
-                    if !self
-                        .tcx
-                        .codegen_fn_attrs(func_did)
-                        .target_features
-                        .iter()
-                        .all(|feature| self.body_target_features.contains(feature))
+                    // the call requires `unsafe`. Don't check this on wasm
+                    // targets, though. For more information on wasm see the
+                    // is_like_wasm check in typeck/src/collect.rs
+                    if !self.tcx.sess.target.options.is_like_wasm
+                        && !self
+                            .tcx
+                            .codegen_fn_attrs(func_did)
+                            .target_features
+                            .iter()
+                            .all(|feature| self.body_target_features.contains(feature))
                     {
                         self.requires_unsafe(expr.span, CallToFunctionWith);
                     }
@@ -192,14 +201,14 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
             ExprKind::InlineAsm { .. } | ExprKind::LlvmInlineAsm { .. } => {
                 self.requires_unsafe(expr.span, UseOfInlineAssembly);
             }
-            ExprKind::Adt {
+            ExprKind::Adt(box Adt {
                 adt_def,
                 variant_index: _,
                 substs: _,
                 user_ty: _,
                 fields: _,
                 base: _,
-            } => match self.tcx.layout_scalar_valid_range(adt_def.did) {
+            }) => match self.tcx.layout_scalar_valid_range(adt_def.did) {
                 (Bound::Unbounded, Bound::Unbounded) => {}
                 _ => self.requires_unsafe(expr.span, InitializingTypeWith),
             },
@@ -213,6 +222,30 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
                     self.requires_unsafe(expr.span, CastOfPointerToInt);
                 }
             }
+            ExprKind::Closure {
+                closure_id,
+                substs: _,
+                upvars: _,
+                movability: _,
+                fake_reads: _,
+            } => {
+                let closure_id = closure_id.expect_local();
+                let closure_def = if let Some((did, const_param_id)) =
+                    ty::WithOptConstParam::try_lookup(closure_id, self.tcx)
+                {
+                    ty::WithOptConstParam { did, const_param_did: Some(const_param_id) }
+                } else {
+                    ty::WithOptConstParam::unknown(closure_id)
+                };
+                let (closure_thir, expr) = self.tcx.thir_body(closure_def);
+                let closure_thir = &closure_thir.borrow();
+                let hir_context = self.tcx.hir().local_def_id_to_hir_id(closure_id);
+                let mut closure_visitor =
+                    UnsafetyVisitor { thir: closure_thir, hir_context, ..*self };
+                closure_visitor.visit_expr(&closure_thir[expr]);
+                // Unsafe blocks can be used in closures, make sure to take it into account
+                self.safety_context = closure_visitor.safety_context;
+            }
             _ => {}
         }
 
@@ -223,6 +256,7 @@ impl<'a, 'tcx> Visitor<'a, 'tcx> for UnsafetyVisitor<'a, 'tcx> {
 #[derive(Clone, Copy)]
 enum SafetyContext {
     Safe,
+    BuiltinUnsafeBlock,
     UnsafeFn,
     UnsafeBlock { span: Span, hir_id: hir::HirId, used: bool },
 }
@@ -335,12 +369,21 @@ impl UnsafeOpKind {
     }
 }
 
-// FIXME: checking unsafety for closures should be handled by their parent body,
-// as they inherit their "safety context" from their declaration site.
 pub fn check_unsafety<'tcx>(tcx: TyCtxt<'tcx>, def: ty::WithOptConstParam<LocalDefId>) {
     // THIR unsafeck is gated under `-Z thir-unsafeck`
     if !tcx.sess.opts.debugging_opts.thir_unsafeck {
         return;
+    }
+
+    // Closures are handled by their owner, if it has a body
+    if tcx.is_closure(def.did.to_def_id()) {
+        let owner = tcx.hir().local_def_id_to_hir_id(def.did).owner;
+        let owner_hir_id = tcx.hir().local_def_id_to_hir_id(owner);
+
+        if tcx.hir().maybe_body_owned_by(owner_hir_id).is_some() {
+            tcx.ensure().thir_check_unsafety(owner);
+            return;
+        }
     }
 
     let (thir, expr) = tcx.thir_body(def);

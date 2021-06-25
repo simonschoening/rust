@@ -16,6 +16,7 @@ use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::{self, subst::Subst, TyCtxt};
 use rustc_span::source_map::Span;
 use rustc_target::abi::{Abi, LayoutOf};
+use std::borrow::Cow;
 use std::convert::TryInto;
 
 pub fn note_on_undefined_behavior_error() -> &'static str {
@@ -311,14 +312,35 @@ pub fn eval_to_allocation_raw_provider<'tcx>(
             let err = ConstEvalErr::new(&ecx, error, None);
             // Some CTFE errors raise just a lint, not a hard error; see
             // <https://github.com/rust-lang/rust/issues/71800>.
-            let emit_as_lint = if let Some(def) = def.as_local() {
+            let is_hard_err = if let Some(def) = def.as_local() {
                 // (Associated) consts only emit a lint, since they might be unused.
-                matches!(tcx.def_kind(def.did.to_def_id()), DefKind::Const | DefKind::AssocConst)
+                !matches!(tcx.def_kind(def.did.to_def_id()), DefKind::Const | DefKind::AssocConst)
+                    // check if the inner InterpError is hard
+                    || err.error.is_hard_err()
             } else {
                 // use of broken constant from other crate: always an error
-                false
+                true
             };
-            if emit_as_lint {
+
+            if is_hard_err {
+                let msg = if is_static {
+                    Cow::from("could not evaluate static initializer")
+                } else {
+                    // If the current item has generics, we'd like to enrich the message with the
+                    // instance and its substs: to show the actual compile-time values, in addition to
+                    // the expression, leading to the const eval error.
+                    let instance = &key.value.instance;
+                    if !instance.substs.is_empty() {
+                        let instance = with_no_trimmed_paths(|| instance.to_string());
+                        let msg = format!("evaluation of `{}` failed", instance);
+                        Cow::from(msg)
+                    } else {
+                        Cow::from("evaluation of constant value failed")
+                    }
+                };
+
+                Err(err.report_as_error(ecx.tcx.at(ecx.cur_span()), &msg))
+            } else {
                 let hir_id = tcx.hir().local_def_id_to_hir_id(def.as_local().unwrap().did);
                 Err(err.report_as_lint(
                     tcx.at(tcx.def_span(def.did)),
@@ -326,13 +348,6 @@ pub fn eval_to_allocation_raw_provider<'tcx>(
                     hir_id,
                     Some(err.span),
                 ))
-            } else {
-                let msg = if is_static {
-                    "could not evaluate static initializer"
-                } else {
-                    "evaluation of constant value failed"
-                };
-                Err(err.report_as_error(ecx.tcx.at(ecx.cur_span()), msg))
             }
         }
         Ok(mplace) => {

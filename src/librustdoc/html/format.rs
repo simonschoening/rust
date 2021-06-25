@@ -9,6 +9,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::iter;
 
+use rustc_attr::{ConstStability, StabilityLevel};
 use rustc_data_structures::captures::Captures;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir as hir;
@@ -177,12 +178,22 @@ impl clean::GenericParamDef {
 
                 Ok(())
             }
-            clean::GenericParamDefKind::Const { ref ty, .. } => {
+            clean::GenericParamDefKind::Const { ref ty, ref default, .. } => {
                 if f.alternate() {
-                    write!(f, "const {}: {:#}", self.name, ty.print(cx))
+                    write!(f, "const {}: {:#}", self.name, ty.print(cx))?;
                 } else {
-                    write!(f, "const {}:&nbsp;{}", self.name, ty.print(cx))
+                    write!(f, "const {}:&nbsp;{}", self.name, ty.print(cx))?;
                 }
+
+                if let Some(default) = default {
+                    if f.alternate() {
+                        write!(f, " = {:#}", default)?;
+                    } else {
+                        write!(f, "&nbsp;=&nbsp;{}", default)?;
+                    }
+                }
+
+                Ok(())
             }
         })
     }
@@ -574,7 +585,7 @@ fn primitive_link(
                     f,
                     "<a class=\"primitive\" href=\"{}primitive.{}.html\">",
                     "../".repeat(len),
-                    prim.to_url_str()
+                    prim.as_sym()
                 )?;
                 needs_termination = true;
             }
@@ -603,7 +614,7 @@ fn primitive_link(
                         f,
                         "<a class=\"primitive\" href=\"{}/primitive.{}.html\">",
                         loc.join("/"),
-                        prim.to_url_str()
+                        prim.as_sym()
                     )?;
                     needs_termination = true;
                 }
@@ -677,7 +688,7 @@ fn fmt_type<'cx>(
             fmt::Display::fmt(&tybounds(param_names, cx), f)
         }
         clean::Infer => write!(f, "_"),
-        clean::Primitive(prim) => primitive_link(f, prim, prim.as_str(), cx),
+        clean::Primitive(prim) => primitive_link(f, prim, &*prim.as_sym().as_str(), cx),
         clean::BareFunction(ref decl) => {
             if f.alternate() {
                 write!(
@@ -1243,15 +1254,6 @@ impl PrintWithSpace for hir::Unsafety {
     }
 }
 
-impl PrintWithSpace for hir::Constness {
-    fn print_with_space(&self) -> &str {
-        match self {
-            hir::Constness::Const => "const ",
-            hir::Constness::NotConst => "",
-        }
-    }
-}
-
 impl PrintWithSpace for hir::IsAsync {
     fn print_with_space(&self) -> &str {
         match self {
@@ -1267,6 +1269,22 @@ impl PrintWithSpace for hir::Mutability {
             hir::Mutability::Not => "",
             hir::Mutability::Mut => "mut ",
         }
+    }
+}
+
+crate fn print_constness_with_space(
+    c: &hir::Constness,
+    s: Option<&ConstStability>,
+) -> &'static str {
+    match (c, s) {
+        // const stable or when feature(staged_api) is not set
+        (
+            hir::Constness::Const,
+            Some(ConstStability { level: StabilityLevel::Stable { .. }, .. }),
+        )
+        | (hir::Constness::Const, None) => "const ",
+        // const unstable or not const
+        _ => "",
     }
 }
 

@@ -456,6 +456,8 @@ impl CheckAttrVisitor<'tcx> {
                     _ => None,
                 }
             }
+            // we check the validity of params elsewhere
+            Target::Param => return false,
             _ => None,
         } {
             return err_fn(meta.span(), &format!("isn't allowed on {}", err));
@@ -523,8 +525,11 @@ impl CheckAttrVisitor<'tcx> {
             self.doc_attr_str_error(meta, "keyword");
             return false;
         }
-        match self.tcx.hir().expect_item(hir_id).kind {
-            ItemKind::Mod(ref module) => {
+        match self.tcx.hir().find(hir_id).and_then(|node| match node {
+            hir::Node::Item(item) => Some(&item.kind),
+            _ => None,
+        }) {
+            Some(ItemKind::Mod(ref module)) => {
                 if !module.item_ids.is_empty() {
                     self.tcx
                         .sess
@@ -577,7 +582,7 @@ impl CheckAttrVisitor<'tcx> {
         target: Target,
         specified_inline: &mut Option<(bool, Span)>,
     ) -> bool {
-        if target == Target::Use {
+        if target == Target::Use || target == Target::ExternCrate {
             let do_inline = meta.name_or_empty() == sym::inline;
             if let Some((prev_inline, prev_span)) = *specified_inline {
                 if do_inline != prev_inline {
@@ -705,7 +710,7 @@ impl CheckAttrVisitor<'tcx> {
         let mut is_valid = true;
 
         if let Some(list) = attr.meta().and_then(|mi| mi.meta_item_list().map(|l| l.to_vec())) {
-            for meta in list {
+            for meta in &list {
                 if let Some(i_meta) = meta.meta_item() {
                     match i_meta.name_or_empty() {
                         sym::alias
@@ -757,7 +762,6 @@ impl CheckAttrVisitor<'tcx> {
                         | sym::html_no_source
                         | sym::html_playground_url
                         | sym::html_root_url
-                        | sym::include
                         | sym::inline
                         | sym::issue_tracker_base_url
                         | sym::keyword
@@ -791,6 +795,30 @@ impl CheckAttrVisitor<'tcx> {
                                             Applicability::MachineApplicable,
                                         );
                                         diag.note("`doc(spotlight)` is now a no-op");
+                                    }
+                                    if i_meta.has_name(sym::include) {
+                                        if let Some(value) = i_meta.value_str() {
+                                            // if there are multiple attributes, the suggestion would suggest deleting all of them, which is incorrect
+                                            let applicability = if list.len() == 1 {
+                                                Applicability::MachineApplicable
+                                            } else {
+                                                Applicability::MaybeIncorrect
+                                            };
+                                            let inner = if attr.style == AttrStyle::Inner {
+                                                "!"
+                                            } else {
+                                                ""
+                                            };
+                                            diag.span_suggestion(
+                                                attr.meta().unwrap().span,
+                                                "use `doc = include_str!` instead",
+                                                format!(
+                                                    "#{}[doc = include_str!(\"{}\")]",
+                                                    inner, value
+                                                ),
+                                                applicability,
+                                            );
+                                        }
                                     }
                                     diag.emit();
                                 },

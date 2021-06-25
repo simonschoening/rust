@@ -194,8 +194,9 @@ use rustc_middle::mir::mono::{InstantiationMode, MonoItem};
 use rustc_middle::mir::visit::Visitor as MirVisitor;
 use rustc_middle::mir::{self, Local, Location};
 use rustc_middle::ty::adjustment::{CustomCoerceUnsized, PointerCast};
+use rustc_middle::ty::print::with_no_trimmed_paths;
 use rustc_middle::ty::subst::{GenericArgKind, InternalSubsts};
-use rustc_middle::ty::{self, GenericParamDefKind, Instance, Ty, TyCtxt, TypeFoldable};
+use rustc_middle::ty::{self, GenericParamDefKind, Instance, Ty, TyCtxt, TypeFoldable, VtblEntry};
 use rustc_middle::{middle::codegen_fn_attrs::CodegenFnAttrFlags, mir::visit::TyContext};
 use rustc_session::config::EntryFnType;
 use rustc_session::lint::builtin::LARGE_ASSIGNMENTS;
@@ -444,12 +445,10 @@ fn collect_items_rec<'tcx>(
     // defined in the local crate.
     if tcx.sess.diagnostic().err_count() > error_count && starting_point.node.krate() != LOCAL_CRATE
     {
+        let formatted_item = with_no_trimmed_paths(|| starting_point.node.to_string());
         tcx.sess.span_note_without_error(
             starting_point.span,
-            &format!(
-                "the above error was encountered while instantiating `{}`",
-                starting_point.node
-            ),
+            &format!("the above error was encountered while instantiating `{}`", formatted_item),
         );
     }
 
@@ -1092,21 +1091,22 @@ fn create_mono_items_for_vtable_methods<'tcx>(
             assert!(!poly_trait_ref.has_escaping_bound_vars());
 
             // Walk all methods of the trait, including those of its supertraits
-            let methods = tcx.vtable_methods(poly_trait_ref);
-            let methods = methods
+            let entries = tcx.vtable_entries(poly_trait_ref);
+            let methods = entries
                 .iter()
-                .cloned()
-                .filter_map(|method| method)
-                .map(|(def_id, substs)| {
-                    ty::Instance::resolve_for_vtable(
+                .filter_map(|entry| match entry {
+                    VtblEntry::MetadataDropInPlace
+                    | VtblEntry::MetadataSize
+                    | VtblEntry::MetadataAlign
+                    | VtblEntry::Vacant => None,
+                    VtblEntry::Method(def_id, substs) => ty::Instance::resolve_for_vtable(
                         tcx,
                         ty::ParamEnv::reveal_all(),
-                        def_id,
+                        *def_id,
                         substs,
                     )
-                    .unwrap()
+                    .filter(|instance| should_codegen_locally(tcx, instance)),
                 })
-                .filter(|&instance| should_codegen_locally(tcx, &instance))
                 .map(|item| create_fn_mono_item(tcx, item, source));
             output.extend(methods);
         }
