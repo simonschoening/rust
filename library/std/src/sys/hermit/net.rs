@@ -1,13 +1,13 @@
-use crate::convert::TryFrom;
+use crate::convert::{TryInto,TryFrom};
 use crate::fmt;
 use crate::io::{self, ErrorKind, IoSlice, IoSliceMut};
-use crate::net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
+use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
 use crate::str;
 use crate::sync::Arc;
 use crate::sys::hermit::abi;
-use crate::sys::hermit::abi::IpAddress::{Ipv4, Ipv6};
 use crate::sys::unsupported;
-use crate::sys_common::AsInner;
+use crate::os::hermit::io::{FromAbi,AsAbi};
+use crate::sys_common::{FromInner,AsInner,IntoInner};
 use crate::time::Duration;
 
 /// Checks whether the HermitCore's socket interface has been started already, and
@@ -24,158 +24,166 @@ pub fn init() -> io::Result<()> {
 }
 
 #[derive(Debug, Clone)]
-pub struct Socket(abi::Handle);
+pub struct Socket(abi::net::Socket);
 
-impl AsInner<abi::Handle> for Socket {
-    fn as_inner(&self) -> &abi::Handle {
+impl FromInner<abi::net::Socket> for Socket {
+    fn from_inner(inner: abi::net::Socket) -> Self {
+        Self(inner)
+    }
+}
+
+impl AsInner<abi::net::Socket> for Socket {
+    fn as_inner(&self) -> &abi::net::Socket {
         &self.0
+    }
+}
+
+impl IntoInner<abi::net::Socket> for Socket {
+    fn into_inner(self) -> abi::net::Socket {
+        let inner = self.as_inner().clone();
+        crate::mem::forget(self);
+        inner
     }
 }
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        let _ = abi::tcpstream::close(self.0);
+        let _ = unsafe { abi::net::socket_close(self.0) };
     }
 }
 
 // Arc is used to count the number of used sockets.
 // Only if all sockets are released, the drop
 // method will close the socket.
-#[derive(Clone)]
+#[derive(Debug,Clone)]
 pub struct TcpStream(Arc<Socket>);
 
 impl TcpStream {
+    pub fn from_socket(socket: abi::net::Socket) -> Self {
+        Self(Arc::new(Socket::from_inner(socket)))
+    }
+
+    pub fn socket(&self) -> abi::net::Socket {
+        self.0
+            .as_inner()
+            .clone()
+    }
+
+    pub fn into_socket(self) -> abi::net::Socket {
+        Arc::try_unwrap(self.0)
+            .unwrap()
+            .into_inner()
+    }
+
     pub fn connect(addr: io::Result<&SocketAddr>) -> io::Result<TcpStream> {
         let addr = addr?;
 
-        match abi::tcpstream::connect(addr.ip().to_string().as_bytes(), addr.port(), None) {
-            Ok(handle) => Ok(TcpStream(Arc::new(Socket(handle)))),
-            _ => Err(io::Error::new_const(
-                ErrorKind::Uncategorized,
-                &"Unable to initiate a connection on a socket",
-            )),
-        }
+        let socket = unsafe { abi::net::socket() }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
+
+        unsafe { abi::net::tcp_bind(socket, abi::net::SocketAddr::V4(abi::net::SocketAddrV4::UNSPECIFIED)) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
+
+        unsafe { abi::net::tcp_connect(socket,addr.as_abi()) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
+
+        Ok(Self::from_socket(socket))
     }
 
     pub fn connect_timeout(saddr: &SocketAddr, duration: Duration) -> io::Result<TcpStream> {
-        match abi::tcpstream::connect(
-            saddr.ip().to_string().as_bytes(),
-            saddr.port(),
-            Some(duration.as_millis() as u64),
-        ) {
-            Ok(handle) => Ok(TcpStream(Arc::new(Socket(handle)))),
-            _ => Err(io::Error::new_const(
-                ErrorKind::Uncategorized,
-                &"Unable to initiate a connection on a socket",
-            )),
-        }
+        let socket = unsafe { abi::net::socket() }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
+
+        unsafe { abi::net::socket_set_timeout(socket, Some(duration)) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
+        
+        unsafe { abi::net::tcp_bind(socket, abi::net::SocketAddr::V4(abi::net::SocketAddrV4::UNSPECIFIED)) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
+
+        unsafe { abi::net::tcp_connect(socket,saddr.as_abi()) } 
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
+
+        Ok(Self::from_socket(socket))
     }
 
     pub fn set_read_timeout(&self, duration: Option<Duration>) -> io::Result<()> {
-        abi::tcpstream::set_read_timeout(*self.0.as_inner(), duration.map(|d| d.as_millis() as u64))
-            .map_err(|_| {
-                io::Error::new_const(ErrorKind::Uncategorized, &"Unable to set timeout value")
-            })
+        unsafe { abi::net::socket_set_timeout(self.socket(),duration) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn set_write_timeout(&self, duration: Option<Duration>) -> io::Result<()> {
-        abi::tcpstream::set_write_timeout(
-            *self.0.as_inner(),
-            duration.map(|d| d.as_millis() as u64),
-        )
-        .map_err(|_| io::Error::new_const(ErrorKind::Uncategorized, &"Unable to set timeout value"))
+        unsafe { abi::net::socket_set_timeout(self.socket(),duration) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn read_timeout(&self) -> io::Result<Option<Duration>> {
-        let duration = abi::tcpstream::get_read_timeout(*self.0.as_inner()).map_err(|_| {
-            io::Error::new_const(ErrorKind::Uncategorized, &"Unable to determine timeout value")
-        })?;
-
-        Ok(duration.map(|d| Duration::from_millis(d)))
+        unsafe { abi::net::socket_timeout(self.socket()) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn write_timeout(&self) -> io::Result<Option<Duration>> {
-        let duration = abi::tcpstream::get_write_timeout(*self.0.as_inner()).map_err(|_| {
-            io::Error::new_const(ErrorKind::Uncategorized, &"Unable to determine timeout value")
-        })?;
-
-        Ok(duration.map(|d| Duration::from_millis(d)))
+        unsafe { abi::net::socket_timeout(self.socket()) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
-    pub fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
-        abi::tcpstream::peek(*self.0.as_inner(), buf)
-            .map_err(|_| io::Error::new_const(ErrorKind::Uncategorized, &"peek failed"))
+    pub fn peek(&self, buffer: &mut [u8]) -> io::Result<usize> {
+        unsafe { abi::net::tcp_peek(self.socket(),buffer) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn read(&self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.read_vectored(&mut [IoSliceMut::new(buffer)])
+        unsafe { abi::net::tcp_read(self.socket(),buffer) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn read_vectored(&self, ioslice: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
-        let mut size: usize = 0;
-
-        for i in ioslice.iter_mut() {
-            let ret = abi::tcpstream::read(*self.0.as_inner(), &mut i[0..]).map_err(|_| {
-                io::Error::new_const(ErrorKind::Uncategorized, &"Unable to read on socket")
-            })?;
-
-            if ret != 0 {
-                size += ret;
-            }
-        }
-
-        Ok(size)
+        let mut empty = IoSliceMut::new(&mut []);
+        let buffer = ioslice
+            .iter_mut()
+            .find(|slice| !slice.is_empty())
+            .unwrap_or(&mut empty);
+        self.read(buffer)
     }
 
     #[inline]
     pub fn is_read_vectored(&self) -> bool {
-        true
+        false
     }
 
     pub fn write(&self, buffer: &[u8]) -> io::Result<usize> {
-        self.write_vectored(&[IoSlice::new(buffer)])
+        unsafe { abi::net::tcp_write(self.socket(),buffer) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn write_vectored(&self, ioslice: &[IoSlice<'_>]) -> io::Result<usize> {
-        let mut size: usize = 0;
-
-        for i in ioslice.iter() {
-            size += abi::tcpstream::write(*self.0.as_inner(), i).map_err(|_| {
-                io::Error::new_const(ErrorKind::Uncategorized, &"Unable to write on socket")
-            })?;
-        }
-
-        Ok(size)
+        let empty = IoSlice::new(&[]);
+        let buffer = ioslice
+            .iter()
+            .find(|slice| !slice.is_empty())
+            .unwrap_or(&empty);
+        self.write(buffer)
     }
 
     #[inline]
     pub fn is_write_vectored(&self) -> bool {
-        true
+        false
     }
 
     pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        let (ipaddr, port) = abi::tcpstream::peer_addr(*self.0.as_inner())
-            .map_err(|_| io::Error::new_const(ErrorKind::Uncategorized, &"peer_addr failed"))?;
-
-        let saddr = match ipaddr {
-            Ipv4(ref addr) => SocketAddr::new(IpAddr::V4(Ipv4Addr::from(addr.0)), port),
-            Ipv6(ref addr) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from(addr.0)), port),
-            _ => {
-                return Err(io::Error::new_const(ErrorKind::Uncategorized, &"peer_addr failed"));
-            }
-        };
-
-        Ok(saddr)
+        unsafe { abi::net::tcp_remote_addr(self.socket()) }
+            .map(|addr| unsafe { SocketAddr::from_abi(addr) })
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-        unsupported()
+        unsafe { abi::net::tcp_local_addr(self.socket()) }
+            .map(|addr| unsafe { SocketAddr::from_abi(addr) })
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-        abi::tcpstream::shutdown(*self.0.as_inner(), how as i32).map_err(|_| {
-            io::Error::new_const(ErrorKind::Uncategorized, &"unable to shutdown socket")
-        })
+        unsafe { abi::net::tcp_shutdown(self.socket(), how.as_abi()) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn duplicate(&self) -> io::Result<TcpStream> {
@@ -190,24 +198,24 @@ impl TcpStream {
         unsupported()
     }
 
-    pub fn set_nodelay(&self, mode: bool) -> io::Result<()> {
-        abi::tcpstream::set_nodelay(*self.0.as_inner(), mode)
-            .map_err(|_| io::Error::new_const(ErrorKind::Uncategorized, &"set_nodelay failed"))
+    pub fn set_nodelay(&self, _mode: bool) -> io::Result<()> {
+        Ok(())
     }
 
     pub fn nodelay(&self) -> io::Result<bool> {
-        abi::tcpstream::nodelay(*self.0.as_inner())
-            .map_err(|_| io::Error::new_const(ErrorKind::Uncategorized, &"nodelay failed"))
+        Ok(true)
     }
 
-    pub fn set_ttl(&self, tll: u32) -> io::Result<()> {
-        abi::tcpstream::set_tll(*self.0.as_inner(), tll)
-            .map_err(|_| io::Error::new_const(ErrorKind::Uncategorized, &"unable to set TTL"))
+    pub fn set_ttl(&self, ttl: u32) -> io::Result<()> {
+        let ttl: Option<u8> = ttl.try_into().ok();
+        unsafe { abi::net::tcp_set_hop_limit(self.socket(),ttl) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn ttl(&self) -> io::Result<u32> {
-        abi::tcpstream::get_tll(*self.0.as_inner())
-            .map_err(|_| io::Error::new_const(ErrorKind::Uncategorized, &"unable to get TTL"))
+        unsafe { abi::net::tcp_hop_limit(self.socket()) }
+            .map(|ttl| ttl.map(u32::from).unwrap_or(u32::MAX))
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
@@ -215,44 +223,59 @@ impl TcpStream {
     }
 
     pub fn set_nonblocking(&self, mode: bool) -> io::Result<()> {
-        abi::tcpstream::set_nonblocking(*self.0.as_inner(), mode).map_err(|_| {
-            io::Error::new_const(ErrorKind::Uncategorized, &"unable to set blocking mode")
-        })
-    }
-}
-
-impl fmt::Debug for TcpStream {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Ok(())
+        unsafe { abi::net::socket_set_non_blocking(self.socket(),mode) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 }
 
 #[derive(Clone)]
-pub struct TcpListener(SocketAddr);
+pub struct TcpListener(Arc<Socket>);
 
 impl TcpListener {
+    pub fn from_socket(socket: abi::net::Socket) -> Self {
+        Self(Arc::new(Socket::from_inner(socket)))
+    }
+
+    pub fn socket(&self) -> abi::net::Socket {
+        self.0
+            .as_inner()
+            .clone()
+    }
+
+    pub fn into_socket(self) -> abi::net::Socket {
+        Arc::try_unwrap(self.0)
+            .unwrap()
+            .into_inner()
+    }
+
     pub fn bind(addr: io::Result<&SocketAddr>) -> io::Result<TcpListener> {
         let addr = addr?;
 
-        Ok(TcpListener(*addr))
+        let socket = unsafe { abi::net::socket() }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
+
+        unsafe { abi::net::tcp_bind(socket, addr.as_abi()) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
+
+        unsafe { abi::net::tcp_listen(socket,16) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
+
+        Ok(Self::from_socket(socket))
     }
 
     pub fn socket_addr(&self) -> io::Result<SocketAddr> {
-        Ok(self.0)
+        unsafe { abi::net::tcp_local_addr(self.socket()) }
+            .map(|addr| unsafe { SocketAddr::from_abi(addr) })
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
-        let (handle, ipaddr, port) = abi::tcplistener::accept(self.0.port())
-            .map_err(|_| io::Error::new_const(ErrorKind::Uncategorized, &"accept failed"))?;
-        let saddr = match ipaddr {
-            Ipv4(ref addr) => SocketAddr::new(IpAddr::V4(Ipv4Addr::from(addr.0)), port),
-            Ipv6(ref addr) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from(addr.0)), port),
-            _ => {
-                return Err(io::Error::new_const(ErrorKind::Uncategorized, &"accept failed"));
-            }
-        };
+        let socket = unsafe { abi::net::tcp_accept(self.socket()) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })?;
 
-        Ok((TcpStream(Arc::new(Socket(handle))), saddr))
+        let stream = TcpStream::from_socket(socket);
+        let remote = stream.socket_addr()?;
+        Ok((stream,remote))
     }
 
     pub fn duplicate(&self) -> io::Result<TcpListener> {
@@ -279,8 +302,9 @@ impl TcpListener {
         unsupported()
     }
 
-    pub fn set_nonblocking(&self, _: bool) -> io::Result<()> {
-        unsupported()
+    pub fn set_nonblocking(&self, mode: bool) -> io::Result<()> {
+        unsafe { abi::net::socket_set_non_blocking(self.socket(),mode) }
+            .map_err(|err| unsafe { io::Error::from_abi(err) })
     }
 }
 

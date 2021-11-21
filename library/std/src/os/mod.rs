@@ -57,17 +57,7 @@ pub mod windows {}
     doc,
     any(
         all(target_arch = "wasm32", not(target_os = "wasi")),
-        all(target_vendor = "fortanix", target_env = "sgx")
-    )
-)))]
-#[cfg(target_os = "hermit")]
-#[path = "hermit/mod.rs"]
-pub mod unix;
-#[cfg(not(all(
-    doc,
-    any(
-        all(target_arch = "wasm32", not(target_os = "wasi")),
-        all(target_vendor = "fortanix", target_env = "sgx")
+        all(target_vendor = "fortanix", target_env = "sgx"),
     )
 )))]
 #[cfg(all(not(target_os = "hermit"), any(unix, doc)))]
@@ -107,6 +97,11 @@ pub mod wasi;
 pub mod windows;
 
 // Others.
+#[cfg(target_os = "hermit")]
+pub mod hermit;
+#[cfg(target_os = "hermit")]
+#[stable(feature = "os", since = "1.0.0")]
+pub use hermit as unix;
 #[cfg(target_os = "android")]
 pub mod android;
 #[cfg(target_os = "dragonfly")]
