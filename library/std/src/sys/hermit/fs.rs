@@ -1,14 +1,20 @@
-use crate::ffi::{CStr, OsString};
+use core::mem::MaybeUninit;
+
+use crate::ffi::{CStr, OsStr, OsString};
 use crate::fmt;
 use crate::hash::{Hash, Hasher};
 use crate::io::{self, Error, ErrorKind};
 use crate::io::{BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
+use crate::os::hermit::ffi::{OsStrExt, OsStringExt};
 use crate::os::hermit::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 use crate::path::{Path, PathBuf};
+use crate::ptr;
+use crate::sync::Arc;
 use crate::sys::common::small_c_string::run_path_with_cstr;
 use crate::sys::cvt;
 use crate::sys::hermit::abi::{
-    self, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+    self, dirent, DT_DIR, DT_LNK, DT_REG, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC,
+    O_WRONLY,
 };
 use crate::sys::hermit::fd::FileDesc;
 use crate::sys::time::SystemTime;
@@ -23,9 +29,33 @@ pub struct File(FileDesc);
 
 pub struct FileAttr(!);
 
-pub struct ReadDir(!);
+// all DirEntry's will have a reference to this struct
+struct InnerReadDir {
+    dirp: FileDesc,
+    root: PathBuf,
+}
 
-pub struct DirEntry(!);
+pub struct ReadDir {
+    inner: Arc<InnerReadDir>,
+    end_of_stream: bool,
+}
+
+impl ReadDir {
+    fn new(inner: InnerReadDir) -> Self {
+        Self { inner: Arc::new(inner), end_of_stream: false }
+    }
+}
+
+pub struct DirEntry {
+    dir: Arc<InnerReadDir>,
+    entry: dirent_min,
+    name: OsString,
+}
+
+struct dirent_min {
+    d_ino: u64,
+    d_type: u32,
+}
 
 #[derive(Clone, Debug)]
 pub struct OpenOptions {
@@ -45,7 +75,22 @@ pub struct FileTimes {}
 
 pub struct FilePermissions(!);
 
-pub struct FileType(!);
+#[derive(Copy, Clone, Eq, Debug)]
+pub struct FileType {
+    mode: u32,
+}
+
+impl PartialEq for FileType {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+    }
+}
+
+impl core::hash::Hash for FileType {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.mode.hash(state);
+    }
+}
 
 #[derive(Debug)]
 pub struct DirBuilder {}
@@ -119,49 +164,21 @@ impl FileTimes {
 
 impl FileType {
     pub fn is_dir(&self) -> bool {
-        self.0
+        self.mode == DT_DIR
     }
-
     pub fn is_file(&self) -> bool {
-        self.0
+        self.mode == DT_REG
     }
-
     pub fn is_symlink(&self) -> bool {
-        self.0
-    }
-}
-
-impl Clone for FileType {
-    fn clone(&self) -> FileType {
-        self.0
-    }
-}
-
-impl Copy for FileType {}
-
-impl PartialEq for FileType {
-    fn eq(&self, _other: &FileType) -> bool {
-        self.0
-    }
-}
-
-impl Eq for FileType {}
-
-impl Hash for FileType {
-    fn hash<H: Hasher>(&self, _h: &mut H) {
-        self.0
-    }
-}
-
-impl fmt::Debug for FileType {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0
+        self.mode == DT_LNK
     }
 }
 
 impl fmt::Debug for ReadDir {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // This will only be called from std::fs::ReadDir, which will add a "ReadDir()" frame.
+        // Thus the result will be e g 'ReadDir("/home")'
+        fmt::Debug::fmt(&*self.inner.root, f)
     }
 }
 
@@ -169,25 +186,102 @@ impl Iterator for ReadDir {
     type Item = io::Result<DirEntry>;
 
     fn next(&mut self) -> Option<io::Result<DirEntry>> {
-        self.0
+        if self.end_of_stream {
+            return None;
+        }
+
+        unsafe {
+            loop {
+                // As of POSIX.1-2017, readdir() is not required to be thread safe; only
+                // readdir_r() is. However, readdir_r() cannot correctly handle platforms
+                // with unlimited or variable NAME_MAX. Many modern platforms guarantee
+                // thread safety for readdir() as long an individual DIR* is not accessed
+                // concurrently, which is sufficient for Rust.
+                // super::os::set_errno(0);
+                let entry_ptr = abi::readdir(self.inner.dirp.as_raw_fd());
+                if entry_ptr.is_null() {
+                    // We either encountered an error, or reached the end. Either way,
+                    // the next call to next() should return None.
+                    self.end_of_stream = true;
+
+                    // To distinguish between errors and end-of-directory, we had to clear
+                    // errno beforehand to check for an error now.
+                    return match super::os::errno() {
+                        0 => None,
+                        e => Some(Err(Error::from_raw_os_error(e))),
+                    };
+                }
+
+                macro_rules! offset_ptr {
+                    ($entry_ptr:expr, $field:ident) => {{
+                        const OFFSET: isize = {
+                            let delusion = MaybeUninit::<dirent>::uninit();
+                            let entry_ptr = delusion.as_ptr();
+                            unsafe {
+                                ptr::addr_of!((*entry_ptr).$field)
+                                    .cast::<u8>()
+                                    .offset_from(entry_ptr.cast::<u8>())
+                            }
+                        };
+                        if true {
+                            // Cast to the same type determined by the else branch.
+                            $entry_ptr.byte_offset(OFFSET).cast::<_>()
+                        } else {
+                            #[allow(deref_nullptr)]
+                            {
+                                ptr::addr_of!((*ptr::null::<dirent>()).$field)
+                            }
+                        }
+                    }};
+                }
+
+                // d_name is NOT guaranteed to be null-terminated.
+                let name_bytes = core::slice::from_raw_parts(
+                    offset_ptr!(entry_ptr, d_name) as *const u8,
+                    *offset_ptr!(entry_ptr, d_namelen) as usize,
+                )
+                .to_vec();
+
+                if name_bytes == b"." || name_bytes == b".." {
+                    continue;
+                }
+
+                let name = OsString::from_vec(name_bytes);
+
+                let entry = dirent_min {
+                    d_ino: *offset_ptr!(entry_ptr, d_ino),
+                    d_type: *offset_ptr!(entry_ptr, d_type),
+                };
+
+                return Some(Ok(DirEntry { entry, name: name, dir: Arc::clone(&self.inner) }));
+            }
+        }
     }
 }
 
 impl DirEntry {
     pub fn path(&self) -> PathBuf {
-        self.0
+        self.dir.root.join(self.file_name_os_str())
     }
 
     pub fn file_name(&self) -> OsString {
-        self.0
+        self.file_name_os_str().to_os_string()
     }
 
     pub fn metadata(&self) -> io::Result<FileAttr> {
-        self.0
+        unimplemented!();
     }
 
     pub fn file_type(&self) -> io::Result<FileType> {
-        self.0
+        Ok(FileType { mode: self.entry.d_type })
+    }
+
+    pub fn ino(&self) -> u64 {
+        self.entry.d_ino
+    }
+
+    pub fn file_name_os_str(&self) -> &OsStr {
+        self.name.as_os_str()
     }
 }
 
@@ -417,8 +511,12 @@ impl FromRawFd for File {
     }
 }
 
-pub fn readdir(_p: &Path) -> io::Result<ReadDir> {
-    unsupported()
+pub fn readdir(path: &Path) -> io::Result<ReadDir> {
+    let fd_raw = run_path_with_cstr(path, |path| cvt(unsafe { abi::opendir(path.as_ptr()) }))?;
+    let fd = unsafe { FileDesc::from_raw_fd(fd_raw as i32) };
+    let root = path.to_path_buf();
+    let inner = InnerReadDir { dirp: fd, root };
+    Ok(ReadDir::new(inner))
 }
 
 pub fn unlink(path: &Path) -> io::Result<()> {
