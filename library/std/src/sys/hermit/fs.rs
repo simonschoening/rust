@@ -531,8 +531,8 @@ pub fn set_perm(_p: &Path, perm: FilePermissions) -> io::Result<()> {
     match perm.0 {}
 }
 
-pub fn rmdir(_p: &Path) -> io::Result<()> {
-    unsupported()
+pub fn rmdir(path: &Path) -> io::Result<()> {
+    run_path_with_cstr(path, |path| cvt(unsafe { abi::rmdir(path.as_ptr()) }).map(|_| ()))
 }
 
 pub fn remove_dir_all(_path: &Path) -> io::Result<()> {
