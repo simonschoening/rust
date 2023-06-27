@@ -93,7 +93,9 @@ impl core::hash::Hash for FileType {
 }
 
 #[derive(Debug)]
-pub struct DirBuilder {}
+pub struct DirBuilder {
+    mode: u32,
+}
 
 impl FileAttr {
     pub fn size(&self) -> u64 {
@@ -452,11 +454,15 @@ impl File {
 
 impl DirBuilder {
     pub fn new() -> DirBuilder {
-        DirBuilder {}
+        DirBuilder { mode: 0o777 }
     }
 
-    pub fn mkdir(&self, _p: &Path) -> io::Result<()> {
-        unsupported()
+    pub fn mkdir(&self, path: &Path) -> io::Result<()> {
+        run_path_with_cstr(path, |path| cvt(unsafe { abi::mkdir(path.as_ptr(), self.mode) }).map(|_| ()))
+    }
+
+    pub fn set_mode(&mut self, mode: u32) {
+        self.mode = mode as u32;
     }
 }
 
