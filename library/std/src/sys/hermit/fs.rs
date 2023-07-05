@@ -1,10 +1,13 @@
 use core::mem::MaybeUninit;
 
+use abi::DT_UNKNOWN;
+
 use crate::ffi::{CStr, OsStr, OsString};
 use crate::fmt;
 use crate::hash::{Hash, Hasher};
 use crate::io::{self, Error, ErrorKind};
 use crate::io::{BorrowedCursor, IoSlice, IoSliceMut, SeekFrom};
+use crate::mem;
 use crate::os::hermit::ffi::{OsStrExt, OsStringExt};
 use crate::os::hermit::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
 use crate::path::{Path, PathBuf};
@@ -13,8 +16,8 @@ use crate::sync::Arc;
 use crate::sys::common::small_c_string::run_path_with_cstr;
 use crate::sys::cvt;
 use crate::sys::hermit::abi::{
-    self, dirent, DT_DIR, DT_LNK, DT_REG, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC,
-    O_WRONLY,
+    self, dirent, stat as stat_struct, DT_DIR, DT_LNK, DT_REG, O_APPEND, O_CREAT, O_EXCL, O_RDONLY,
+    O_RDWR, O_TRUNC, O_WRONLY, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
 };
 use crate::sys::hermit::fd::FileDesc;
 use crate::sys::time::SystemTime;
@@ -26,8 +29,16 @@ pub use crate::sys_common::fs::{copy, try_exists};
 
 #[derive(Debug)]
 pub struct File(FileDesc);
+#[derive(Clone)]
+pub struct FileAttr {
+    stat_val: stat_struct,
+}
 
-pub struct FileAttr(!);
+impl FileAttr {
+    fn from_stat(stat_val: stat_struct) -> Self {
+        Self { stat_val }
+    }
+}
 
 // all DirEntry's will have a reference to this struct
 struct InnerReadDir {
@@ -73,7 +84,10 @@ pub struct OpenOptions {
 #[derive(Copy, Clone, Debug, Default)]
 pub struct FileTimes {}
 
-pub struct FilePermissions(!);
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FilePermissions {
+    mode: u32,
+}
 
 #[derive(Copy, Clone, Eq, Debug)]
 pub struct FileType {
@@ -98,64 +112,49 @@ pub struct DirBuilder {
 }
 
 impl FileAttr {
-    pub fn size(&self) -> u64 {
-        self.0
-    }
-
-    pub fn perm(&self) -> FilePermissions {
-        self.0
-    }
-
-    pub fn file_type(&self) -> FileType {
-        self.0
-    }
-
     pub fn modified(&self) -> io::Result<SystemTime> {
-        self.0
+        Ok(SystemTime::new(self.stat_val.st_mtime, self.stat_val.st_mtime_nsec))
     }
 
     pub fn accessed(&self) -> io::Result<SystemTime> {
-        self.0
+        Ok(SystemTime::new(self.stat_val.st_atime, self.stat_val.st_atime_nsec))
     }
 
     pub fn created(&self) -> io::Result<SystemTime> {
-        self.0
+        Ok(SystemTime::new(self.stat_val.st_ctime, self.stat_val.st_ctime_nsec))
     }
-}
 
-impl Clone for FileAttr {
-    fn clone(&self) -> FileAttr {
-        self.0
+    pub fn size(&self) -> u64 {
+        self.stat_val.st_size as u64
+    }
+    pub fn perm(&self) -> FilePermissions {
+        FilePermissions { mode: (self.stat_val.st_mode) }
+    }
+
+    pub fn file_type(&self) -> FileType {
+        let masked_mode = self.stat_val.st_mode & S_IFMT;
+        let mode = match masked_mode {
+            S_IFDIR => DT_DIR,
+            S_IFLNK => DT_LNK,
+            S_IFREG => DT_REG,
+            _ => DT_UNKNOWN,
+        };
+        FileType { mode: mode }
     }
 }
 
 impl FilePermissions {
     pub fn readonly(&self) -> bool {
-        self.0
+        // check if any class (owner, group, others) has write permission
+        self.mode & 0o222 == 0
     }
 
     pub fn set_readonly(&mut self, _readonly: bool) {
-        self.0
+        unimplemented!()
     }
-}
 
-impl Clone for FilePermissions {
-    fn clone(&self) -> FilePermissions {
-        self.0
-    }
-}
-
-impl PartialEq for FilePermissions {
-    fn eq(&self, _other: &FilePermissions) -> bool {
-        self.0
-    }
-}
-
-impl Eq for FilePermissions {}
-
-impl fmt::Debug for FilePermissions {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0
+    pub fn mode(&self) -> u32 {
+        self.mode as u32
     }
 }
 
@@ -199,7 +198,7 @@ impl Iterator for ReadDir {
                 // with unlimited or variable NAME_MAX. Many modern platforms guarantee
                 // thread safety for readdir() as long an individual DIR* is not accessed
                 // concurrently, which is sufficient for Rust.
-                // super::os::set_errno(0);
+                super::os::set_errno(0);
                 let entry_ptr = abi::readdir(self.inner.dirp.as_raw_fd());
                 if entry_ptr.is_null() {
                     // We either encountered an error, or reached the end. Either way,
@@ -271,7 +270,7 @@ impl DirEntry {
     }
 
     pub fn metadata(&self) -> io::Result<FileAttr> {
-        unimplemented!();
+        lstat(&self.path())
     }
 
     pub fn file_type(&self) -> io::Result<FileType> {
@@ -386,7 +385,9 @@ impl File {
     }
 
     pub fn file_attr(&self) -> io::Result<FileAttr> {
-        Err(Error::from_raw_os_error(22))
+        let mut stat_val: stat_struct = unsafe { mem::zeroed() };
+        self.0.fstat(&mut stat_val)?;
+        Ok(FileAttr::from_stat(stat_val))
     }
 
     pub fn fsync(&self) -> io::Result<()> {
@@ -458,7 +459,9 @@ impl DirBuilder {
     }
 
     pub fn mkdir(&self, path: &Path) -> io::Result<()> {
-        run_path_with_cstr(path, |path| cvt(unsafe { abi::mkdir(path.as_ptr(), self.mode) }).map(|_| ()))
+        run_path_with_cstr(path, |path| {
+            cvt(unsafe { abi::mkdir(path.as_ptr(), self.mode) }).map(|_| ())
+        })
     }
 
     pub fn set_mode(&mut self, mode: u32) {
@@ -534,7 +537,7 @@ pub fn rename(_old: &Path, _new: &Path) -> io::Result<()> {
 }
 
 pub fn set_perm(_p: &Path, perm: FilePermissions) -> io::Result<()> {
-    match perm.0 {}
+    Err(Error::from_raw_os_error(22))
 }
 
 pub fn rmdir(path: &Path) -> io::Result<()> {
@@ -558,12 +561,20 @@ pub fn link(_original: &Path, _link: &Path) -> io::Result<()> {
     unsupported()
 }
 
-pub fn stat(_p: &Path) -> io::Result<FileAttr> {
-    unsupported()
+pub fn stat(path: &Path) -> io::Result<FileAttr> {
+    run_path_with_cstr(path, |path| {
+        let mut stat_val: stat_struct = unsafe { mem::zeroed() };
+        cvt(unsafe { abi::stat(path.as_ptr(), &mut stat_val) })?;
+        Ok(FileAttr::from_stat(stat_val))
+    })
 }
 
-pub fn lstat(_p: &Path) -> io::Result<FileAttr> {
-    unsupported()
+pub fn lstat(path: &Path) -> io::Result<FileAttr> {
+    run_path_with_cstr(path, |path| {
+        let mut stat_val: stat_struct = unsafe { mem::zeroed() };
+        cvt(unsafe { abi::lstat(path.as_ptr(), &mut stat_val) })?;
+        Ok(FileAttr::from_stat(stat_val))
+    })
 }
 
 pub fn canonicalize(_p: &Path) -> io::Result<PathBuf> {

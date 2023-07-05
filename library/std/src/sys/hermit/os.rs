@@ -8,17 +8,22 @@ use crate::os::hermit::ffi::OsStringExt;
 use crate::path::{self, PathBuf};
 use crate::str;
 use crate::sync::Mutex;
+use crate::sys::decode_error_kind;
 use crate::sys::hermit::abi;
 use crate::sys::memchr;
 use crate::sys::unsupported;
 use crate::vec;
 
 pub fn errno() -> i32 {
-    0
+    unsafe { abi::get_errno() }
+}
+
+pub fn set_errno(e: i32) {
+    unsafe { abi::set_errno(e) };
 }
 
 pub fn error_string(_errno: i32) -> String {
-    "operation successful".to_string()
+    decode_error_kind(_errno).to_string()
 }
 
 pub fn getcwd() -> io::Result<PathBuf> {
